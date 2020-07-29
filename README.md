@@ -1,5 +1,7 @@
 # IPFS-Lite
 
+This is a fork of [hsanjuan/ipfs-lite](https://github.com/hsanjuan/ipfs-lite). All credit goes to the author.
+
 <p align="center">
 <img src="logo.png" alt="ipfs-lite" title="ipfs-lite" />
 </p>

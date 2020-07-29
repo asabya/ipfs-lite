@@ -6,47 +6,35 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/asabya/ipfs-lite/config"
+	"github.com/asabya/ipfs-lite/repo"
 	"io/ioutil"
+	"os"
 
-	ipfslite "github.com/hsanjuan/ipfs-lite"
+	ipfslite "github.com/asabya/ipfs-lite"
 	"github.com/ipfs/go-cid"
-	crypto "github.com/libp2p/go-libp2p-core/crypto"
-	"github.com/multiformats/go-multiaddr"
 )
 
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Bootstrappers are using 1024 keys. See:
-	// https://github.com/ipfs/infra/issues/378
-	crypto.MinRsaKeyBits = 1024
-
-	ds, err := ipfslite.BadgerDatastore("test")
+	root := "/tmp" + string(os.PathSeparator) + repo.Root
+	conf, err := config.ConfigInit(2048)
 	if err != nil {
-		panic(err)
+		return
 	}
-	priv, _, err := crypto.GenerateKeyPair(crypto.RSA, 2048)
+	err = repo.Init(root, conf)
 	if err != nil {
-		panic(err)
+		return
 	}
 
-	listen, _ := multiaddr.NewMultiaddr("/ip4/0.0.0.0/tcp/4005")
-
-	h, dht, err := ipfslite.SetupLibp2p(
-		ctx,
-		priv,
-		nil,
-		[]multiaddr.Multiaddr{listen},
-		ds,
-		ipfslite.Libp2pOptionsExtra...,
-	)
-
+	r, err := repo.Open(root)
 	if err != nil {
-		panic(err)
+		return
 	}
 
-	lite, err := ipfslite.New(ctx, ds, h, dht, nil)
+	lite, err := ipfslite.New(ctx, r)
 	if err != nil {
 		panic(err)
 	}
