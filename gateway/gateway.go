@@ -18,7 +18,6 @@ import (
 	ipfspath "github.com/ipfs/go-path"
 	"github.com/ipfs/go-path/resolver"
 	unixfile "github.com/ipfs/go-unixfs/file"
-	ufsio "github.com/ipfs/go-unixfs/io"
 	coreiface "github.com/ipfs/interface-go-ipfs-core"
 	ipath "github.com/ipfs/interface-go-ipfs-core/path"
 	"github.com/libp2p/go-libp2p-core/routing"
@@ -37,7 +36,6 @@ type GatewayConfig struct {
 }
 
 type Peer interface {
-	GetFile(ctx context.Context, c cid.Cid) (ufsio.DagReader, error)
 	Get(context.Context, cid.Cid) (ipld.Node, error)
 }
 
