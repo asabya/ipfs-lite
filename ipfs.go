@@ -8,18 +8,22 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"os"
 	"strings"
 	"sync"
 
+	"github.com/asabya/ipfs-lite/gateway"
 	"github.com/asabya/ipfs-lite/repo"
 	"github.com/ipfs/go-bitswap"
 	"github.com/ipfs/go-bitswap/network"
-	blockservice "github.com/ipfs/go-blockservice"
+	"github.com/ipfs/go-blockservice"
 	"github.com/ipfs/go-cid"
 	"github.com/ipfs/go-datastore"
 	syncds "github.com/ipfs/go-datastore/sync"
 	blockstore "github.com/ipfs/go-ipfs-blockstore"
 	chunker "github.com/ipfs/go-ipfs-chunker"
+	files "github.com/ipfs/go-ipfs-files"
 	provider "github.com/ipfs/go-ipfs-provider"
 	"github.com/ipfs/go-ipfs-provider/queue"
 	"github.com/ipfs/go-ipfs-provider/simple"
@@ -32,13 +36,14 @@ import (
 	"github.com/ipfs/go-unixfs/importer/trickle"
 	ufsio "github.com/ipfs/go-unixfs/io"
 	"github.com/libp2p/go-libp2p-core/crypto"
-	host "github.com/libp2p/go-libp2p-core/host"
+	"github.com/libp2p/go-libp2p-core/host"
 	inet "github.com/libp2p/go-libp2p-core/network"
-	peer "github.com/libp2p/go-libp2p-core/peer"
-	routing "github.com/libp2p/go-libp2p-core/routing"
+	"github.com/libp2p/go-libp2p-core/peer"
+	"github.com/libp2p/go-libp2p-core/routing"
 	swarm "github.com/libp2p/go-libp2p-swarm"
 	"github.com/multiformats/go-multiaddr"
-	multihash "github.com/multiformats/go-multihash"
+	manet "github.com/multiformats/go-multiaddr-net"
+	"github.com/multiformats/go-multihash"
 )
 
 func init() {
@@ -74,6 +79,8 @@ func New(
 	ctx context.Context,
 	r repo.Repo,
 ) (*Peer, error) {
+	logging.SetLogLevel("gateway", "Debug")
+	logging.SetLogLevel("ipfslite", "Debug")
 	store := syncds.MutexWrap(datastore.NewMapDatastore())
 	cfg, err := r.Config()
 	if err != nil {
@@ -128,10 +135,59 @@ func New(
 		p.bserv.Close()
 		return nil, err
 	}
-
+	go p.runGateway()
 	go p.autoclose()
 
 	return p, nil
+}
+
+func (p *Peer) runGateway() {
+	listeningMultiAddr := "/ip4/0.0.0.0/tcp/8080"
+	addr, err := multiaddr.NewMultiaddr(listeningMultiAddr)
+	if err != nil {
+		logger.Error("http newMultiaddr:", err.Error())
+		return
+	}
+
+	list, err := manet.Listen(addr)
+	if err != nil {
+		logger.Error("http manet Listen:", err.Error())
+		return
+	}
+	defer list.Close()
+
+	// we might have listened to /tcp/0 - let's see what we are listing on
+	addr = list.Multiaddr()
+	logger.Infof("API server listening on %s", addr)
+	topMux := http.NewServeMux()
+	gway := gateway.NewGatewayHandler(gateway.GatewayConfig{
+		Headers:      map[string][]string{},
+		Writable:     true,
+		PathPrefixes: []string{"ipfs"},
+	}, p)
+
+	topMux.Handle(gateway.IpfsPathPrefix, gway)
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// ServeMux does not support requests with CONNECT method,
+		// so we need to handle them separately
+		// https://golang.org/src/net/http/request.go#L111
+		if r.Method == http.MethodConnect {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		logger.Debug(r.URL.String())
+		topMux.ServeHTTP(w, r)
+	})
+	server := &http.Server{
+		Handler: handler,
+	}
+	defer server.Close()
+	err = server.Serve(manet.NetListener(list))
+	if err != nil {
+		logger.Error("serve :", err.Error())
+		return
+	}
 }
 
 func (p *Peer) setupBlockstore() error {
@@ -307,9 +363,43 @@ func (p *Peer) AddFile(ctx context.Context, r io.Reader, params *AddParams) (ipl
 	return n, err
 }
 
+func (p *Peer) AddDir(ctx context.Context, dir string, params *AddParams) (ipld.Node, error) {
+	stat, err := os.Lstat(dir)
+	if err != nil {
+		return nil, err
+	}
+	if params == nil {
+		params = &AddParams{}
+	}
+	if params.HashFun == "" {
+		params.HashFun = "sha2-256"
+	}
+
+	sf, err := files.NewSerialFile(dir, false, stat)
+	if err != nil {
+		return nil, err
+	}
+	fAddr, err := NewAdder(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	fAddr.Chunker = params.Chunker
+	fAddr.CidBuilder, err = merkledag.PrefixForCidVersion(1)
+	if err != nil {
+		return nil, err
+	}
+	fAddr.RawLeaves = params.RawLeaves
+	fAddr.NoCopy = params.NoCopy
+	nd, err := fAddr.AddAll(sf)
+	if err != nil {
+		return nil, err
+	}
+	return nd, nil
+}
+
 // GetFile returns a reader to a file as identified by its root CID. The file
 // must have been added as a UnixFS DAG (default for IPFS).
-func (p *Peer) GetFile(ctx context.Context, c cid.Cid) (ufsio.ReadSeekCloser, error) {
+func (p *Peer) GetFile(ctx context.Context, c cid.Cid) (ufsio.DagReader, error) {
 	n, err := p.Get(ctx, c)
 	if err != nil {
 		return nil, err

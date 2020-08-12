@@ -6,13 +6,11 @@ package main
 import (
 	"context"
 	"fmt"
-	"github.com/asabya/ipfs-lite/config"
-	"github.com/asabya/ipfs-lite/repo"
-	"io/ioutil"
 	"os"
 
 	ipfslite "github.com/asabya/ipfs-lite"
-	"github.com/ipfs/go-cid"
+	"github.com/asabya/ipfs-lite/config"
+	"github.com/asabya/ipfs-lite/repo"
 )
 
 func main() {
@@ -39,18 +37,15 @@ func main() {
 		panic(err)
 	}
 
-	lite.Bootstrap(ipfslite.DefaultBootstrapPeers())
-
-	c, _ := cid.Decode("QmWATWQ7fVPP2EFGu71UkfnqhYXDYH566qy47CnJDgvs8u")
-	rsc, err := lite.GetFile(ctx, c)
-	if err != nil {
-		panic(err)
-	}
-	defer rsc.Close()
-	content, err := ioutil.ReadAll(rsc)
+	n, err := lite.AddDir(context.Background(), "/home/sabyasachi/go/src/gitlab.com/diplay-uploader/resources/video/Game of Thrones Season 8 Official Trailer (HBO)/hls", nil)
 	if err != nil {
 		panic(err)
 	}
 
-	fmt.Println(string(content))
+	fmt.Println(n.Cid())
+	for i, j := range n.Links() {
+		fmt.Println(i, j.Cid, j.Name)
+	}
+	fmt.Println(n.Size())
+	select{ }
 }
