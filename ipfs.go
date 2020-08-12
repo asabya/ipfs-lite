@@ -135,13 +135,13 @@ func New(
 		p.bserv.Close()
 		return nil, err
 	}
-	go p.runGateway()
+	go p.runGateway(ctx)
 	go p.autoclose()
 
 	return p, nil
 }
 
-func (p *Peer) runGateway() {
+func (p *Peer) runGateway(ctx context.Context) {
 	listeningMultiAddr := "/ip4/0.0.0.0/tcp/8080"
 	addr, err := multiaddr.NewMultiaddr(listeningMultiAddr)
 	if err != nil {
@@ -164,7 +164,7 @@ func (p *Peer) runGateway() {
 		Headers:      map[string][]string{},
 		Writable:     true,
 		PathPrefixes: []string{"ipfs"},
-	}, p)
+	}, p, merkledag.NewReadOnlyDagService(merkledag.NewSession(ctx, p)))
 
 	topMux.Handle(gateway.IpfsPathPrefix, gway)
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	gopath "path"
 	"regexp"
 	"runtime/debug"
 	"strings"
@@ -12,10 +13,13 @@ import (
 
 	"github.com/ipfs/go-cid"
 	files "github.com/ipfs/go-ipfs-files"
+	ipld "github.com/ipfs/go-ipld-format"
 	logging "github.com/ipfs/go-log/v2"
-	"github.com/ipfs/go-path"
+	ipfspath "github.com/ipfs/go-path"
 	"github.com/ipfs/go-path/resolver"
+	unixfile "github.com/ipfs/go-unixfs/file"
 	ufsio "github.com/ipfs/go-unixfs/io"
+	coreiface "github.com/ipfs/interface-go-ipfs-core"
 	ipath "github.com/ipfs/interface-go-ipfs-core/path"
 	"github.com/libp2p/go-libp2p-core/routing"
 )
@@ -34,6 +38,7 @@ type GatewayConfig struct {
 
 type Peer interface {
 	GetFile(ctx context.Context, c cid.Cid) (ufsio.DagReader, error)
+	Get(context.Context, cid.Cid) (ipld.Node, error)
 }
 
 // gatewayHandler is a HTTP handler that serves IPFS objects (accessible by default at /ipfs/<path>)
@@ -41,6 +46,7 @@ type Peer interface {
 type GatewayHandler struct {
 	config GatewayConfig
 	peer   Peer
+	dag ipld.DAGService
 }
 
 // StatusResponseWriter enables us to override HTTP Status Code passed to
@@ -62,17 +68,18 @@ func (sw *statusResponseWriter) WriteHeader(code int) {
 	sw.ResponseWriter.WriteHeader(code)
 }
 
-func NewGatewayHandler(c GatewayConfig, peer Peer) *GatewayHandler {
+func NewGatewayHandler(c GatewayConfig, peer Peer, dag ipld.DAGService) *GatewayHandler {
 	log.Debug("NewGatewayHandler")
 	i := &GatewayHandler{
 		config: c,
 		peer:   peer,
+		dag: dag,
 	}
 	return i
 }
 
 func parseIpfsPath(p string) (cid.Cid, string, error) {
-	rootPath, err := path.ParsePath(p)
+	rootPath, err := ipfspath.ParsePath(p)
 	if err != nil {
 		return cid.Cid{}, "", err
 	}
@@ -88,7 +95,7 @@ func parseIpfsPath(p string) (cid.Cid, string, error) {
 		return cid.Cid{}, "", err
 	}
 
-	return rootCid, path.Join(rsegs[2:]), nil
+	return rootCid, ipfspath.Join(rsegs[2:]), nil
 }
 
 func (i *GatewayHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -170,7 +177,20 @@ func (i *GatewayHandler) getOrHeadHandler(w http.ResponseWriter, r *http.Request
 		webError(w, "invalid ipfs path", err, http.StatusBadRequest)
 		return
 	}
-
+	resolvedPath, err := i.ResolvePath(r.Context(), parsedPath)
+	switch err {
+	case nil:
+	case coreiface.ErrOffline:
+		webError(w, "ipfs resolve -r "+escapedURLPath, err, http.StatusServiceUnavailable)
+		return
+	default:
+		webError(w, "ipfs resolve -r "+escapedURLPath, err, http.StatusNotFound)
+		return
+	}
+	node, err := i.dag.Get(r.Context(), resolvedPath.Cid())
+	if err != nil {
+		return
+	}
 	p := strings.Split(urlPath, "/")
 	c, err := cid.Decode(p[2])
 	switch err {
@@ -180,7 +200,7 @@ func (i *GatewayHandler) getOrHeadHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 	log.Debug("cid ", c.String())
-	dr, err := i.peer.GetFile(r.Context(), c)
+	dr, err := unixfile.NewUnixfsFile(r.Context(), i.dag, node)
 	if err != nil {
 		webError(w, "ipfs cat "+escapedURLPath, err, http.StatusNotFound)
 		return
@@ -202,8 +222,19 @@ func (i *GatewayHandler) getOrHeadHandler(w http.ResponseWriter, r *http.Request
 	w.Header().Set("X-IPFS-Path", urlPath)
 	w.Header().Set("Etag", responseEtag)
 	modtime := time.Unix(1, 0)
+	if f, ok := dr.(files.File); ok {
+		urlFilename := r.URL.Query().Get("filename")
+		var name string
+		if urlFilename != "" {
+			w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename*=UTF-8''%s", url.PathEscape(urlFilename)))
+			name = urlFilename
+		} else {
+			name = getFilename(urlPath)
+		}
+		i.serveFile(w, r, name, modtime, f)
+		return
+	}
 
-	i.serveFile(w, r, "", modtime, dr)
 	// See statusResponseWriter.WriteHeader
 	// and https://github.com/ipfs/go-ipfs/issues/7164
 	// Note: this needs to occur before listingTemplate.Execute otherwise we get
@@ -225,7 +256,7 @@ func (i *GatewayHandler) getOrHeadHandler(w http.ResponseWriter, r *http.Request
 	var backLink string = originalUrlPath
 
 	// don't go further up than /ipfs/$hash/
-	pathSplit := path.SplitList(urlPath)
+	pathSplit := ipfspath.SplitList(urlPath)
 	switch {
 	// keep backlink
 	case len(pathSplit) == 3: // url: /ipfs/$hash
@@ -246,7 +277,7 @@ func (i *GatewayHandler) getOrHeadHandler(w http.ResponseWriter, r *http.Request
 	log.Debug(hash)
 }
 
-func (i *GatewayHandler) serveFile(w http.ResponseWriter, req *http.Request, name string, modtime time.Time, file ufsio.DagReader) {
+func (i *GatewayHandler) serveFile(w http.ResponseWriter, req *http.Request, name string, modtime time.Time, file files.File) {
 	log.Debug("serveFile")
 	log.Debug(file.Size())
 
@@ -276,4 +307,37 @@ func webErrorWithCode(w http.ResponseWriter, message string, err error, code int
 // return a 500 error and log
 func internalWebError(w http.ResponseWriter, err error) {
 	webErrorWithCode(w, "internalWebError", err, http.StatusInternalServerError)
+}
+
+func (i *GatewayHandler) ResolvePath(ctx context.Context, p ipath.Path) (ipath.Resolved, error) {
+	if _, ok := p.(ipath.Resolved); ok {
+		return p.(ipath.Resolved), nil
+	}
+	if err := p.IsValid(); err != nil {
+		return nil, err
+	}
+
+	ip := ipfspath.Path(p.String())
+	resolveOnce := resolver.ResolveSingle
+
+	r := &resolver.Resolver{
+		DAG:         i.dag,
+		ResolveOnce: resolveOnce,
+	}
+
+	node, rest, err := r.ResolveToLastNode(ctx, ip)
+	if err != nil {
+		return nil, err
+	}
+
+	root, err := cid.Parse(ip.Segments()[1])
+	if err != nil {
+		return nil, err
+	}
+
+	return ipath.NewResolvedPath(ip, node, root, gopath.Join(rest...)), nil
+}
+
+func getFilename(s string) string {
+	return gopath.Base(s)
 }
